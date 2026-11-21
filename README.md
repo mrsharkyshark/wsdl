@@ -1,116 +1,42 @@
-wsdl
+## wsdl (Workshop DL)
 
-wsdl (Workshop DL) is a lightweight POSIX shell script for downloading and backing up Steam Workshop addons.
+Download Steam Workshop addons as compressed backups, with their preview images.
 
-It backs up .gma files, compresses them with XZ, verifies archives, and downloads preview images in JPEG or AVIF format.
+`wsdl` takes Steam Workshop IDs or item URLs, backs up each addon’s `.gma` file as a verified `.xz` archive, and saves its preview image. If the addon is already in your local Steam cache, it’s used directly. Otherwise, it’s downloaded with SteamCMD.
 
-Features
-Backs up .gma files from the local Steam cache.
-Downloads missing addons using SteamCMD.
-Supports anonymous and authenticated downloads.
-Compresses and verifies backups with XZ.
-Downloads Workshop preview images.
-Supports JPEG and AVIF formats.
-Parallel processing and automatic retries.
-Optional SteamCMD download cleanup.
-Requirements
-curl
-GNU grep (with -P support)
-xargs
-file
-xz
-SteamCMD (only when downloading missing local files)
+### Features
 
-Optional:
+*   Accepts IDs or full URLs (`...?id=NNNNN`)
+*   Uses the local Steam cache when possible, and SteamCMD otherwise
+*   Prompts for Steam login only when SteamCMD requires it
+*   Stores each backup as a `.gma.xz`, checked with `xz -t` before the uncompressed copy is removed
+*   Saves the preview as JPEG by default, or AVIF with `-a`
+*   Gets preview images from Steam’s public API, so sign-in-only pages still work
+*   Offers to delete SteamCMD downloads, one item at a time, defaulting to No
 
-avifenc (for AVIF conversion)
-ImageMagick (magick or convert) for image conversion.
-Usage
-sh
-./wsdl [options] [Workshop ID or URL ...]
-
-
-You can also provide IDs through standard input:
+### Usage
 
 sh
-cat ids.txt | ./wsdl
 
-Examples
+```
+wsdl 3842833548
+wsdl 'https://steamcommunity.com/sharedfiles/filedetails/?id=3842833548'
+wsdl -a -u myaccount 3842833548 1234567890
+cat ids.txt | wsdl -j 8
+```
 
-Download and back up an addon:
+Run `wsdl -h` for all options.
 
-sh
-./wsdl 3842833548
+### Requirements
 
+`curl`, `grep` (GNU, with `-P`), `xargs`, `file`, `xz`. Also `avifenc` for `-a`, and `steamcmd` for items not in the local cache. ImageMagick (`magick` or `convert`) is optional and converts non-JPEG previews to JPEG.
 
-Using a Workshop URL:
+### Output
 
-sh
-./wsdl 'https://steamcommunity.com/sharedfiles/filedetails/?id=3842833548'
+For each item, in `./ID/`:
 
-
-Save the preview as AVIF:
-
-sh
-./wsdl -a 3842833548
-
-
-Use multiple parallel workers:
-
-sh
-./wsdl -j 8 3842833548 1234567890
-
-
-Specify a Steam account:
-
-sh
-./wsdl -u myaccount 3842833548
-
-Options
-Option	Description
--u USER	Steam account username
--c PATH	SteamCMD binary path
--d DIR	SteamCMD download directory
--w DIR	Steam Workshop cache directory
--j JOBS	Number of parallel workers
--r RETRIES	Download and compression retries
--q QUALITY	AVIF quality (0–100)
--a	Save preview images as AVIF
--s SPEED	AVIF encoding speed (0–10)
--h	Show help
-Output
-
-Each Workshop item gets its own directory:
-
-text
-3842833548/
-├── addon.gma.xz
-└── 3842833548.jpg
-
-
-With -a:
-
-text
-3842833548/
-├── addon.gma.xz
-└── 3842833548.avif
-
-
-Archives are verified before the original uncompressed backup is removed.
-
-SteamCMD Authentication
-
-Downloads are attempted anonymously first.
-
-If authentication is required, wsdl prompts for your Steam username and lets SteamCMD handle your password and Steam Guard verification.
-
-SteamCMD may save an authentication token for future sessions.
-
-Notes
-Existing backups and preview images are skipped.
-Local Steam Workshop cache files are never deleted.
-SteamCMD downloads can optionally be deleted after a verified backup.
-Failed archive verification preserves the original .gma file.
-License
-
-See LICENSE for license information.
+```
+ID/
+├── ID.jpg              # preview (ID.avif with -a)
+└── <name>.gma.xz       # verified backup
+```
