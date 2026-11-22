@@ -9,14 +9,14 @@ Usage: $(basename "$0") [options] [ID-or-URL ...]
        cat ids.txt | $(basename "$0") [options]
 
 Each item can be a Steam Workshop ID or a URL containing ?id=, e.g.
-  3842833548
-  'https://steamcommunity.com/sharedfiles/filedetails/?id=3842833548'
+  1234567890
+  'https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890'
 Quote URLs in the shell, because & and ? are special there.
 
 For each item:
   1. If the .gma is already in the local Steam cache, back it up.
      Otherwise, download the item with SteamCMD.
-  2. Compress the .gma to ID/<name>.gma.xz and check it with xz -t.
+  2. Compress the .gma to ID/ID_YYYYMMDD.gma.xz (Steam update date) and check it with xz -t.
   3. Once the archive checks out, remove the uncompressed copy. The
      .gma.xz is then the only backup, and the empty backup/ folder is removed.
   4. Download the addon's preview image as ID/ID.jpg (JPEG). Pass -a to
@@ -40,16 +40,21 @@ Options:
                then prompt for a username if login is required)
   -c PATH      steamcmd binary                       (default: $STEAMCMD)
   -d DIR       SteamCMD download directory           (default: $STEAMCMD_DIR)
-  -w DIR       Steam client Workshop cache           (default: $STEAM_WORKSHOP)
+  -w DIR       Steam client Workshop cache for the app (default: ~/.local/share/Steam/steamapps/workshop/content/APPID)
   -j JOBS      parallel jobs for archive/image work  (default: $JOBS)
   -r RETRIES   attempts for download and xz steps    (default: $RETRIES)
   -q QUALITY   avifenc quality, 0-100                (default: $QUALITY, with -a)
+  -g APPID     Steam app ID of the game (default: 4000, Garry's Mod)
+  -o DIR       directory to save results into         (default: current directory)
+  -f           put all archives and images directly in -o DIR, not in one folder per ID
+  -k           keep SteamCMD downloads (default: delete after a verified archive)
   -a           save the preview as AVIF (ID.avif) instead of JPEG
   -s SPEED     avifenc speed, 0 (slow) - 10 (fast)   (default: $SPEED, with -a)
   -h, --help   show this help and exit
 
-Output, for each ID, in ./ID/:
-  <name>.gma.xz       backup of the .gma, compressed and verified
+Output, for each ID, in OUTDIR/ID/ (or directly in OUTDIR with -f):
+  ID_YYYYMMDD.gma.xz  backup of the .gma, compressed and verified
+                      (date is the Steam update date, UTC)
   ID.jpg              preview image (JPEG, default)
   ID.avif             preview image (with -a)
 
@@ -67,10 +72,11 @@ workshop page asks for sign-in still get their real image. The page's
 og:image tag is used only as a fallback.
 
 Examples:
-  $(basename "$0") 3842833548
-  $(basename "$0") 'https://steamcommunity.com/sharedfiles/filedetails/?id=3842833548'
-  $(basename "$0") -a 3842833548
-  $(basename "$0") -u myaccount 3842833548 1234567890
+  $(basename "$0") 1234567890
+  $(basename "$0") 'https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890'
+  $(basename "$0") -g 730 -u your_steam_user 1234567890
+  $(basename "$0") -a 1234567890
+  $(basename "$0") -u your_steam_user 1234567890 1234567890
   cat ids.txt | $(basename "$0") -j 8
 EOF
 }
@@ -93,7 +99,7 @@ retry() {
   n=1
   while :; do
     "$@" && return 0
-    echo "Retry $n/$RETRIES failed..."
+    echo "Retry $n/$RETRIES failed..." >&2
     [ "$n" -ge "$RETRIES" ] && return 1
     n=$((n + 1))
     sleep 1
@@ -110,6 +116,30 @@ first_gma() {
 first_archive() {
   [ -d "$1" ] || return 0
   find "$1" -maxdepth 1 -type f -name '*.gma.xz' | head -n 1
+}
+
+# Where an item's files go. Normally OUTDIR/ID/. With -f, everything goes
+# directly into OUTDIR, and temporary backups go to OUTDIR/.backup/ID/.
+item_dir() {
+  if [ "$FLAT" -eq 1 ]; then echo "$OUTDIR"; else echo "$OUTDIR/$1"; fi
+}
+
+backup_dir() {
+  if [ "$FLAT" -eq 1 ]; then echo "$OUTDIR/.backup/$1"; else echo "$OUTDIR/$1/backup"; fi
+}
+
+# Print the archive path for item $1 if one exists: ID_YYYYMMDD.gma.xz,
+# or an older ID.gma.xz name.
+find_archive() {
+  d=$(item_dir "$1")
+  [ -d "$d" ] || return 0
+  for f in "$d/$1".gma.xz "$d/$1"_*.gma.xz; do
+    if [ -f "$f" ]; then
+      echo "$f"
+      return 0
+    fi
+  done
+  return 0
 }
 
 # Read a line from the terminal into REPLY. Fails if there is no terminal.
@@ -260,12 +290,25 @@ xz_to() {
   return 1
 }
 
-# Compress backup .gma $2 for item $1 into directory $3.
+# Print the Steam update date (UTC, YYYYMMDD) of item $1.
+item_date() {
+  ts=$(curl -fsS --max-time 30 -X POST \
+         "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/" \
+         -d itemcount=1 -d "publishedfileids[0]=$1" 2>/dev/null \
+       | sed -n 's/.*"time_updated" *: *\([0-9][0-9]*\).*/\1/p' \
+       | head -n 1)
+  [ -n "$ts" ] || return 1
+  date -u -d "@$ts" +%Y%m%d
+}
+
+# Compress backup .gma $2 for item $1 into directory $3, named ID_DATE.gma.xz.
+# $4 is the Steam update date.
 archive_gma() {
   id=$1
   gma=$2
   outdir=$3
-  dst="$outdir/$(basename "$gma").xz"
+  date=$4
+  dst="$outdir/${id}_${date}.gma.xz"
 
   if [ -f "$dst" ]; then
     echo "Skipping GMA compression for $id (already exists)"
@@ -287,20 +330,23 @@ archive_gma() {
 # Returns 0 if backed up or already backed up, 2 if SteamCMD is needed, 1 on error.
 prepare_id() {
   id=$1
-  bdir="$id/backup"
-  mkdir -p "$bdir" || return 1
+  bdir=$(backup_dir "$id")
 
-  if [ -n "$(first_gma "$bdir")" ] || [ -n "$(first_archive "$id")" ]; then
+  if [ -n "$(first_gma "$bdir")" ] || [ -n "$(find_archive "$id")" ]; then
     echo "Already backed up for $id"
     return 0
   fi
 
+  # Use an existing copy from the Steam client cache or the SteamCMD folder,
+  # so nothing is downloaded again.
   src=$(first_gma "$STEAM_WORKSHOP/$id")
+  [ -n "$src" ] || src=$(first_gma "$STEAMCMD_DIR/steamapps/workshop/content/$APPID/$id")
   if [ -z "$src" ]; then
     return 2
   fi
 
-  echo "Found local .gma for $id, backing it up"
+  mkdir -p "$bdir" || return 1
+  echo "Found existing .gma for $id, backing it up"
   if cp -p -- "$src" "$bdir/"; then
     return 0
   fi
@@ -308,21 +354,25 @@ prepare_id() {
   return 1
 }
 
-# Stage 2: SteamCMD. Runs one batch for all IDs in $NEEDFILE with login $1.
+# Stage 2: SteamCMD. Runs one batch for the IDs listed in file $2 with login $1.
 run_batch() {
   login=$1
+  listfile=$2
   set -- +force_install_dir "$STEAMCMD_DIR" +login "$login"
-  for id in $(cat "$NEEDFILE"); do
+  for id in $(cat "$listfile"); do
     set -- "$@" +workshop_download_item "$APPID" "$id"
   done
   set -- "$@" +quit
   "$STEAMCMD" "$@" </dev/null 2>&1 | tee "$STEAMCMD_DIR/last-run.log"
 }
 
-# True if the last SteamCMD run reported that login is required or failed.
+# True if the last SteamCMD run reported that login is required.
+# $1 is the login used for that run. For anonymous runs, a failed download
+# also means login is needed, since Workshop downloads require an account.
 needs_login() {
   grep -qiE 'Login Failure|Invalid Password|Steam Guard|Two-factor|Not Logged On|Access Denied|Need to be logged in|requires login' \
-    "$STEAMCMD_DIR/last-run.log"
+    "$STEAMCMD_DIR/last-run.log" && return 0
+  [ "$1" = anonymous ] && grep -qE 'Download item [0-9]+ failed' "$STEAMCMD_DIR/last-run.log"
 }
 
 # Log in interactively so SteamCMD can prompt for the password and Steam Guard code.
@@ -341,13 +391,10 @@ download_needed() {
   fi
   mkdir -p "$STEAMCMD_DIR" || return 1
 
-  if [ -n "$STEAM_USER" ]; then
-    run_batch "$STEAM_USER"
-  else
-    run_batch anonymous
-  fi
+  first=${STEAM_USER:-anonymous}
+  run_batch "$first" "$NEEDFILE"
 
-  if needs_login; then
+  if needs_login "$first"; then
     echo "SteamCMD reports that login is required."
     if [ -z "$STEAM_USER" ]; then
       if ! read_tty "Steam username: "; then
@@ -357,8 +404,25 @@ download_needed() {
       STEAM_USER=$REPLY
     fi
     steamcmd_login "$STEAM_USER" || return 1
-    run_batch "$STEAM_USER"
+    run_batch "$STEAM_USER" "$NEEDFILE"
   fi
+
+  # Steam sometimes refuses a download temporarily ("Failure"). Retry the
+  # items that are still missing, up to RETRIES attempts in total.
+  n=1
+  while [ "$n" -lt "$RETRIES" ]; do
+    missing="$WORK/missing"
+    : > "$missing"
+    while read -r id; do
+      [ -n "$(first_gma "$STEAMCMD_DIR/steamapps/workshop/content/$APPID/$id")" ] || echo "$id" >> "$missing"
+    done < "$NEEDFILE"
+    [ -s "$missing" ] || return 0
+
+    n=$((n + 1))
+    echo "Retrying $(wc -l < "$missing" | tr -d ' ') download(s), attempt $n/$RETRIES, after a pause..." >&2
+    sleep 10
+    run_batch "${STEAM_USER:-anonymous}" "$missing"
+  done
 }
 
 # Stage 3 (serial): copy each SteamCMD download into its ID/backup/ folder.
@@ -368,11 +432,11 @@ backup_downloaded() {
   while read -r id; do
     src=$(first_gma "$STEAMCMD_DIR/steamapps/workshop/content/$APPID/$id")
     if [ -z "$src" ]; then
-      echo "SteamCMD did not download a .gma for $id"
+      echo "SteamCMD did not download a .gma for $id. Check that the logged-in account owns the game (appid $APPID) and can access the item."
       continue
     fi
-    mkdir -p "$id/backup" || continue
-    if cp -p -- "$src" "$id/backup/"; then
+    mkdir -p "$(backup_dir "$id")" || continue
+    if cp -p -- "$src" "$(backup_dir "$id")/"; then
       echo "$id" >> "$DLFILE"
       echo "Backed up SteamCMD download for $id"
     else
@@ -384,7 +448,8 @@ backup_downloaded() {
 # Stage 4 (parallel worker): preview image and archive, from the backup.
 process_id() {
   id=$1
-  outdir=$id
+  outdir=$(item_dir "$id")
+  bdir=$(backup_dir "$id")
   status=0
 
   mkdir -p "$outdir" || return 1
@@ -405,12 +470,18 @@ process_id() {
   fi
 
   # GMA archive: compress from the backup, verify, then drop the uncompressed copy
-  gma=$(first_gma "$outdir/backup")
-  if [ -n "$gma" ]; then
-    archive_gma "$id" "$gma" "$outdir" || status=1
+  gma=$(first_gma "$bdir")
+  if [ -z "$(find_archive "$id")" ] && [ -n "$gma" ]; then
+    date=$(retry item_date "$id")
+    if [ -z "$date" ]; then
+      echo "Could not get the Steam update date for $id; not archived"
+      status=1
+    else
+      archive_gma "$id" "$gma" "$outdir" "$date" || status=1
+    fi
   fi
 
-  arc=$(first_archive "$outdir")
+  arc=$(find_archive "$id")
   if [ -z "$arc" ]; then
     echo "No .gma available for $id"
     status=1
@@ -418,11 +489,12 @@ process_id() {
     echo "Archive failed verification for $id; keeping the uncompressed backup"
     status=1
   else
-    raw=$(first_gma "$outdir/backup")
+    raw=$(first_gma "$bdir")
     if [ -n "$raw" ]; then
       rm -f -- "$raw" && echo "Verified archive; removed uncompressed copy for $id"
     fi
-    rmdir "$outdir/backup" 2>/dev/null || true
+    rmdir "$bdir" 2>/dev/null || true
+    rmdir "$OUTDIR/.backup" 2>/dev/null || true
   fi
 
   if [ "$status" -eq 0 ]; then
@@ -433,31 +505,27 @@ process_id() {
   return "$status"
 }
 
-# Stage 5 (serial): offer to delete leftover SteamCMD downloads for the requested IDs,
-# including ones from earlier runs, as long as the backup and archive exist.
-# Only deletes under $STEAMCMD_DIR, never the Steam client cache, and never a backup.
+# Stage 5 (serial): delete SteamCMD downloads once their archive is verified.
+# Only deletes under $STEAMCMD_DIR, never the Steam client cache, and never a backup
+# or archive. Copies whose archive is missing or fails the check are kept.
+# Use -k to keep the downloads.
 delete_downloaded() {
-  echo
-  echo "SteamCMD downloads can be deleted below. Verified archives in ID/ are kept."
+  [ "$KEEP_DOWNLOADS" -eq 1 ] && return 0
 
   while read -r id; do
     copy="$STEAMCMD_DIR/steamapps/workshop/content/$APPID/$id"
     [ -d "$copy" ] || continue
 
-    arc=$(first_archive "$id")
+    arc=$(find_archive "$id")
     if [ -z "$arc" ] || ! xz -t -- "$arc" 2>/dev/null; then
       echo "Keeping $copy (verified archive missing)"
       continue
     fi
 
-    if ask_yn "Delete SteamCMD download $copy?"; then
-      case $copy in
-        "$STEAMCMD_DIR"/*) rm -rf -- "$copy" && echo "Deleted $copy" ;;
-        *) echo "Refusing to delete outside $STEAMCMD_DIR: $copy" ;;
-      esac
-    else
-      echo "Kept $copy"
-    fi
+    case $copy in
+      "$STEAMCMD_DIR"/*) rm -rf -- "$copy" && echo "Deleted SteamCMD download for $id" ;;
+      *) echo "Refusing to delete outside $STEAMCMD_DIR: $copy" ;;
+    esac
   done < "$IDLIST"
 }
 
@@ -479,10 +547,14 @@ RETRIES=3
 QUALITY=52
 SPEED=6
 AVIF=0
+OUTDIR=.
+KEEP_DOWNLOADS=0
+FLAT=0
 APPID=4000
 
-# Steam client cache: checked first for an existing .gma.
-STEAM_WORKSHOP="$HOME/.local/share/Steam/steamapps/workshop/content/$APPID"
+# Steam client cache: checked first for an existing .gma. Empty means
+# "the Steam cache for APPID", filled in after option parsing.
+STEAM_WORKSHOP=
 # SteamCMD install/download dir. Workshop items it downloads land under here.
 STEAMCMD=steamcmd
 STEAMCMD_DIR="$HOME/.local/share/wsdl/steamcmd"
@@ -492,10 +564,14 @@ case ${1:-} in
   --help) usage; exit 0 ;;
 esac
 
-while getopts ":hau:c:d:w:j:r:q:s:" opt; do
+while getopts ":hkfao:g:u:c:d:w:j:r:q:s:" opt; do
   case $opt in
     h) usage; exit 0 ;;
     a) AVIF=1 ;;
+    k) KEEP_DOWNLOADS=1 ;;
+    f) FLAT=1 ;;
+    o) OUTDIR=$OPTARG ;;
+    g) APPID=$OPTARG ;;
     u) STEAM_USER=$OPTARG ;;
     c) STEAMCMD=$OPTARG ;;
     d) STEAMCMD_DIR=$OPTARG ;;
@@ -509,6 +585,11 @@ while getopts ":hau:c:d:w:j:r:q:s:" opt; do
   esac
 done
 shift $((OPTIND - 1))
+
+case $APPID in
+  ''|*[!0-9]*) echo "$(basename "$0"): -g must be a numeric app ID" >&2; exit 2 ;;
+esac
+[ -n "$STEAM_WORKSHOP" ] || STEAM_WORKSHOP="$HOME/.local/share/Steam/steamapps/workshop/content/$APPID"
 
 for n in "$JOBS" "$RETRIES"; do
   case $n in
@@ -529,6 +610,9 @@ for cmd in $DEPS; do
     exit 1
   fi
 done
+
+# Output directory
+mkdir -p "$OUTDIR" || { echo "$(basename "$0"): cannot create output directory: $OUTDIR" >&2; exit 1; }
 
 # Working files
 WORK=$(mktemp -d) || exit 1
@@ -565,7 +649,7 @@ fi
 SELF=$0
 [ -f "$SELF" ] || SELF=$(command -v "$0")
 
-export RETRIES QUALITY SPEED AVIF STEAM_WORKSHOP STEAMCMD_DIR APPID
+export RETRIES QUALITY SPEED AVIF FLAT OUTDIR STEAM_WORKSHOP STEAMCMD_DIR APPID
 
 # Stage 1: local cache -> backup; collect IDs that need SteamCMD
 while read -r id; do
