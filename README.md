@@ -111,4 +111,4 @@ Downloading Workshop items requires an account that owns the game. If a download
 
 ## License
 
-Specify a license before publishing.
+GNU General Public License v3.0
